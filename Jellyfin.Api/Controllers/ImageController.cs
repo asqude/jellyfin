@@ -1797,12 +1797,43 @@ public class ImageController : BaseJellyfinApiController
 
         try
         {
+            string? imageTag = null;
+
+            // For chapter images, try to get the tag from the chapter directly
+            if (info.Type == ImageType.Chapter && imageIndex.HasValue)
+            {
+                var chapter = BaseItem.ChapterManager.GetChapter(item.Id, imageIndex.Value);
+                if (chapter is not null && !string.IsNullOrEmpty(chapter.ImageTag))
+                {
+                    imageTag = chapter.ImageTag;
+                    _logger.LogInformation(
+                        "Using pre-transcoded chapter ImageTag for {Item} Chapter {Index}: {Tag}",
+                        item.Name,
+                        imageIndex.Value,
+                        imageTag);
+                }
+            }
+
+            // Fallback to calculating the tag if not found
+            if (string.IsNullOrEmpty(imageTag))
+            {
+                imageTag = _imageProcessor.GetImageCacheTag(item, info);
+                if (info.Type == ImageType.Chapter)
+                {
+                    _logger.LogInformation(
+                        "Calculated chapter ImageTag for {Item} Chapter {Index}: {Tag}",
+                        item.Name,
+                        imageIndex,
+                        imageTag);
+                }
+            }
+
             return new ImageInfo
             {
                 Path = info.Path,
                 ImageIndex = imageIndex,
                 ImageType = info.Type,
-                ImageTag = _imageProcessor.GetImageCacheTag(item, info),
+                ImageTag = imageTag,
                 Size = length,
                 BlurHash = blurhash,
                 Width = width,
@@ -1873,9 +1904,43 @@ public class ImageController : BaseJellyfinApiController
 
         TimeSpan? cacheDuration = null;
 
+        // Get the actual current tag for validation
+        string? actualTag = null;
+        if (imageType == ImageType.Chapter && imageIndex.HasValue && item is not null)
+        {
+            var chapter = BaseItem.ChapterManager.GetChapter(item.Id, imageIndex.Value);
+            if (chapter is not null && !string.IsNullOrEmpty(chapter.ImageTag))
+            {
+                actualTag = chapter.ImageTag;
+            }
+            else
+            {
+                actualTag = _imageProcessor.GetImageCacheTag(item, imageInfo);
+            }
+        }
+        else if (item is not null)
+        {
+            actualTag = _imageProcessor.GetImageCacheTag(item, imageInfo);
+        }
+
         if (!string.IsNullOrEmpty(tag))
         {
-            cacheDuration = TimeSpan.FromDays(365);
+            if (imageType == ImageType.Chapter)
+            {
+                _logger.LogInformation(
+                    "Chapter image request for {Item} Index {Index}: RequestedTag={RequestedTag}, ActualTag={ActualTag}, Match={Match}",
+                    item?.Name,
+                    imageIndex,
+                    tag,
+                    actualTag,
+                    tag.Equals(actualTag, StringComparison.OrdinalIgnoreCase));
+            }
+
+            // Only set long cache if the tag matches
+            if (actualTag is not null && tag.Equals(actualTag, StringComparison.OrdinalIgnoreCase))
+            {
+                cacheDuration = TimeSpan.FromDays(365);
+            }
         }
 
         var responseHeaders = new Dictionary<string, string>

@@ -17,6 +17,7 @@ using Jellyfin.Extensions;
 using Jellyfin.MediaEncoding.Hls.Playlist;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
+using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Streaming;
@@ -60,6 +61,7 @@ public class DynamicHlsController : BaseJellyfinApiController
     private readonly IDynamicHlsPlaylistGenerator _dynamicHlsPlaylistGenerator;
     private readonly DynamicHlsHelper _dynamicHlsHelper;
     private readonly EncodingOptions _encodingOptions;
+    private readonly PreTranscodedHlsHelper _preTranscodedHlsHelper;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DynamicHlsController"/> class.
@@ -75,6 +77,7 @@ public class DynamicHlsController : BaseJellyfinApiController
     /// <param name="dynamicHlsHelper">Instance of <see cref="DynamicHlsHelper"/>.</param>
     /// <param name="encodingHelper">Instance of <see cref="EncodingHelper"/>.</param>
     /// <param name="dynamicHlsPlaylistGenerator">Instance of <see cref="IDynamicHlsPlaylistGenerator"/>.</param>
+    /// <param name="preTranscodedHlsHelper">Instance of <see cref="PreTranscodedHlsHelper"/>.</param>
     public DynamicHlsController(
         ILibraryManager libraryManager,
         IUserManager userManager,
@@ -86,7 +89,8 @@ public class DynamicHlsController : BaseJellyfinApiController
         ILogger<DynamicHlsController> logger,
         DynamicHlsHelper dynamicHlsHelper,
         EncodingHelper encodingHelper,
-        IDynamicHlsPlaylistGenerator dynamicHlsPlaylistGenerator)
+        IDynamicHlsPlaylistGenerator dynamicHlsPlaylistGenerator,
+        PreTranscodedHlsHelper preTranscodedHlsHelper)
     {
         _libraryManager = libraryManager;
         _userManager = userManager;
@@ -99,6 +103,7 @@ public class DynamicHlsController : BaseJellyfinApiController
         _dynamicHlsHelper = dynamicHlsHelper;
         _encodingHelper = encodingHelper;
         _dynamicHlsPlaylistGenerator = dynamicHlsPlaylistGenerator;
+        _preTranscodedHlsHelper = preTranscodedHlsHelper;
 
         _encodingOptions = serverConfigurationManager.GetEncodingOptions();
     }
@@ -465,6 +470,19 @@ public class DynamicHlsController : BaseJellyfinApiController
         [FromQuery] bool enableAudioVbrEncoding = true,
         [FromQuery] bool alwaysBurnInSubtitleWhenTranscoding = false)
     {
+        // Check for pre-transcoded HLS format
+        var item = _libraryManager.GetItemById<Video>(itemId);
+        if (item is not null && _preTranscodedHlsHelper.HasPreTranscodedHls(item))
+        {
+            _logger.LogInformation("Pre-transcoded HLS format detected for item {ItemId}, serving master.m3u8 directly", itemId);
+            var masterPlaylistPath = _preTranscodedHlsHelper.GetMasterPlaylistPath(item);
+            if (masterPlaylistPath is not null && _fileSystem.FileExists(masterPlaylistPath))
+            {
+                var playlistContent = await System.IO.File.ReadAllTextAsync(masterPlaylistPath).ConfigureAwait(false);
+                return Content(playlistContent, MimeTypes.GetMimeType("playlist.m3u8"));
+            }
+        }
+
         var streamingRequest = new HlsVideoRequestDto
         {
             Id = itemId,
@@ -523,6 +541,90 @@ public class DynamicHlsController : BaseJellyfinApiController
         };
 
         return await _dynamicHlsHelper.GetMasterHlsPlaylist(TranscodingJobType, streamingRequest, enableAdaptiveBitrateStreaming).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gets a sub-playlist, init file, or segment for pre-transcoded HLS format (e.g., video_fhd_avc/video_fhd_avc.m3u8, video_fhd_avc/init.mp4, video_fhd_avc/seg_000.m4s).
+    /// </summary>
+    /// <param name="itemId">The item id.</param>
+    /// <param name="subPath">The subdirectory and file name (e.g., "video_fhd_avc/video_fhd_avc.m3u8", "video_fhd_avc/init.mp4", "video_fhd_avc/seg_000.m4s").</param>
+    /// <response code="200">File returned.</response>
+    /// <response code="404">File not found.</response>
+    /// <returns>A <see cref="FileResult"/> containing the requested file.</returns>
+    // Can't require authentication just yet due to seeing some requests come from Chrome without full query string
+    [AllowAnonymous]
+    [HttpGet("Videos/{itemId}/{*subPath}")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesPlaylistFile]
+    [ProducesVideoFile]
+    public ActionResult GetPreTranscodedSubPlaylist(
+        [FromRoute, Required] Guid itemId,
+        [FromRoute, Required] string subPath)
+    {
+        // Only handle .m3u8, .m4s, and init.mp4 files in subdirectories
+        if (string.IsNullOrWhiteSpace(subPath))
+        {
+            return NotFound();
+        }
+
+        var isPlaylist = subPath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase);
+        var isSegment = subPath.EndsWith(".m4s", StringComparison.OrdinalIgnoreCase);
+        var isInit = subPath.EndsWith("init.mp4", StringComparison.OrdinalIgnoreCase);
+
+        if (!isPlaylist && !isSegment && !isInit)
+        {
+            return NotFound();
+        }
+
+        // Check for pre-transcoded HLS format
+        var item = _libraryManager.GetItemById<Video>(itemId);
+        if (item is null || !_preTranscodedHlsHelper.HasPreTranscodedHls(item))
+        {
+            return NotFound();
+        }
+
+        var basePath = _preTranscodedHlsHelper.GetPreTranscodedBasePath(item);
+        if (basePath is null)
+        {
+            return NotFound();
+        }
+
+        // Security check: ensure the path doesn't contain directory traversal
+        if (subPath.Contains("..", StringComparison.Ordinal))
+        {
+            return BadRequest("Invalid path.");
+        }
+
+        // Construct the full path to the file
+        var filePath = Path.Combine(basePath, subPath);
+        filePath = Path.GetFullPath(filePath);
+
+        // Security check: ensure the path is within the base directory
+        var baseFullPath = Path.GetFullPath(basePath);
+        if (!filePath.StartsWith(baseFullPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return BadRequest("Invalid path.");
+        }
+
+        if (!_fileSystem.FileExists(filePath))
+        {
+            _logger.LogWarning("Pre-transcoded file not found: {FilePath} for item {ItemId}", filePath, itemId);
+            return NotFound();
+        }
+
+        _logger.LogDebug("Serving pre-transcoded file: {FilePath}", filePath);
+
+        if (isPlaylist)
+        {
+            var playlistContent = System.IO.File.ReadAllText(filePath);
+            return Content(playlistContent, MimeTypes.GetMimeType("playlist.m3u8"));
+        }
+        else
+        {
+            // For segments and init files, serve as binary
+            return FileStreamResponseHelpers.GetStaticFileResult(filePath, MimeTypes.GetMimeType(filePath));
+        }
     }
 
     /// <summary>

@@ -97,7 +97,12 @@ namespace Emby.Server.Implementations.Library
 
             // zfs
             "**/.zfs/**",
-            "**/.zfs"
+            "**/.zfs",
+
+            // HLS segment files (pre-transcoded format)
+            "**/*.m4s",
+            "**/seg_*.m4s",
+            "**/init.mp4"
         };
 
         private static readonly GlobOptions _globOptions = new GlobOptions

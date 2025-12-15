@@ -517,6 +517,7 @@ namespace Emby.Server.Implementations
 
             serviceCollection.AddSingleton<IMediaEncoder, MediaBrowser.MediaEncoding.Encoder.MediaEncoder>();
             serviceCollection.AddSingleton<EncodingHelper>();
+            serviceCollection.AddSingleton<PreTranscodedHlsHelper>();
             serviceCollection.AddSingleton<IPathManager, PathManager>();
             serviceCollection.AddSingleton<IExternalDataManager, ExternalDataManager>();
 
@@ -561,7 +562,15 @@ namespace Emby.Server.Implementations
 
             serviceCollection.AddSingleton<IUserViewManager, UserViewManager>();
 
-            serviceCollection.AddSingleton<IChapterManager, ChapterManager>();
+            serviceCollection.AddSingleton<IChapterManager>(provider => new ChapterManager(
+                provider.GetRequiredService<ILogger<ChapterManager>>(),
+                provider.GetRequiredService<IFileSystem>(),
+                provider.GetRequiredService<IMediaEncoder>(),
+                provider.GetRequiredService<IChapterRepository>(),
+                provider.GetRequiredService<ILibraryManager>(),
+                provider.GetRequiredService<IPathManager>(),
+                provider.GetRequiredService<PreTranscodedHlsHelper>(),
+                provider.GetService<IImageProcessor>()));
 
             serviceCollection.AddSingleton<IAuthService, AuthService>();
             serviceCollection.AddSingleton<IQuickConnect, QuickConnectManager>();

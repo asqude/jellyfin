@@ -2,17 +2,21 @@ using System;
 using System.ComponentModel.DataAnnotations;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using Jellyfin.Api.Attributes;
 using Jellyfin.Api.Helpers;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
+using MediaBrowser.Controller.Entities;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.IO;
 using MediaBrowser.Model.Net;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Api.Controllers;
 
@@ -25,6 +29,8 @@ public class HlsSegmentController : BaseJellyfinApiController
     private readonly IFileSystem _fileSystem;
     private readonly IServerConfigurationManager _serverConfigurationManager;
     private readonly ITranscodeManager _transcodeManager;
+    private readonly ILibraryManager _libraryManager;
+    private readonly ILogger<HlsSegmentController> _logger;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="HlsSegmentController"/> class.
@@ -32,14 +38,20 @@ public class HlsSegmentController : BaseJellyfinApiController
     /// <param name="fileSystem">Instance of the <see cref="IFileSystem"/> interface.</param>
     /// <param name="serverConfigurationManager">Instance of the <see cref="IServerConfigurationManager"/> interface.</param>
     /// <param name="transcodeManager">Instance of the <see cref="ITranscodeManager"/> interface.</param>
+    /// <param name="libraryManager">Instance of the <see cref="ILibraryManager"/> interface.</param>
+    /// <param name="logger">Instance of the <see cref="ILogger{HlsSegmentController}"/> interface.</param>
     public HlsSegmentController(
         IFileSystem fileSystem,
         IServerConfigurationManager serverConfigurationManager,
-        ITranscodeManager transcodeManager)
+        ITranscodeManager transcodeManager,
+        ILibraryManager libraryManager,
+        ILogger<HlsSegmentController> logger)
     {
         _fileSystem = fileSystem;
         _serverConfigurationManager = serverConfigurationManager;
         _transcodeManager = transcodeManager;
+        _libraryManager = libraryManager;
+        _logger = logger;
     }
 
     /// <summary>

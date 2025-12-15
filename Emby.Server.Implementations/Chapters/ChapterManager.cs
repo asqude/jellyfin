@@ -1,11 +1,15 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Api.Helpers;
 using Jellyfin.Extensions;
+using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Chapters;
+using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
@@ -32,6 +36,8 @@ public class ChapterManager : IChapterManager
     private readonly IChapterRepository _chapterRepository;
     private readonly ILibraryManager _libraryManager;
     private readonly IPathManager _pathManager;
+    private readonly PreTranscodedHlsHelper? _preTranscodedHlsHelper;
+    private readonly IImageProcessor? _imageProcessor;
 
     /// <summary>
     /// The first chapter ticks.
@@ -47,13 +53,17 @@ public class ChapterManager : IChapterManager
     /// <param name="chapterRepository">The <see cref="IChapterRepository"/>.</param>
     /// <param name="libraryManager">The <see cref="ILibraryManager"/>.</param>
     /// <param name="pathManager">The <see cref="IPathManager"/>.</param>
+    /// <param name="preTranscodedHlsHelper">Optional pre-transcoded HLS helper.</param>
+    /// <param name="imageProcessor">Optional image processor for cache tags.</param>
     public ChapterManager(
         ILogger<ChapterManager> logger,
         IFileSystem fileSystem,
         IMediaEncoder encoder,
         IChapterRepository chapterRepository,
         ILibraryManager libraryManager,
-        IPathManager pathManager)
+        IPathManager pathManager,
+        PreTranscodedHlsHelper? preTranscodedHlsHelper = null,
+        IImageProcessor? imageProcessor = null)
     {
         _logger = logger;
         _fileSystem = fileSystem;
@@ -61,6 +71,8 @@ public class ChapterManager : IChapterManager
         _chapterRepository = chapterRepository;
         _libraryManager = libraryManager;
         _pathManager = pathManager;
+        _preTranscodedHlsHelper = preTranscodedHlsHelper;
+        _imageProcessor = imageProcessor;
     }
 
     /// <summary>
@@ -120,6 +132,13 @@ public class ChapterManager : IChapterManager
         }
 
         var libraryOptions = _libraryManager.GetLibraryOptions(video);
+
+        // Skip extraction for pre-transcoded videos (dummy file)
+        if (_preTranscodedHlsHelper is not null && _preTranscodedHlsHelper.HasPreTranscodedHls(video))
+        {
+            _logger.LogInformation("Skipping chapter image extraction for {Video} because pre-transcoded HLS format is detected. Chapter images should be extracted during pre-transcoding.", video.Name);
+            extractImages = false;
+        }
 
         if (!IsEligibleForChapterImageExtraction(video, libraryOptions))
         {
@@ -242,13 +261,166 @@ public class ChapterManager : IChapterManager
     /// <inheritdoc />
     public ChapterInfo? GetChapter(Guid baseItemId, int index)
     {
+        // Check for pre-transcoded format first
+        var video = _libraryManager.GetItemById<Video>(baseItemId);
+        if (video is not null)
+        {
+            var preTranscodedChapters = GetPreTranscodedChapters(video);
+            if (preTranscodedChapters is not null && index >= 0 && index < preTranscodedChapters.Count)
+            {
+                _logger.LogInformation(
+                    "Returning pre-transcoded chapter {Index} for {Video} (Position={PositionTicks}, Tag={Tag})",
+                    index,
+                    video.Name,
+                    preTranscodedChapters[index].StartPositionTicks,
+                    preTranscodedChapters[index].ImageTag);
+                return preTranscodedChapters[index];
+            }
+        }
+        else
+        {
+            _logger.LogWarning("Video not found for baseItemId={BaseItemId}", baseItemId);
+        }
+
         return _chapterRepository.GetChapter(baseItemId, index);
     }
 
     /// <inheritdoc />
     public IReadOnlyList<ChapterInfo> GetChapters(Guid baseItemId)
     {
+        // Check for pre-transcoded format first
+        var video = _libraryManager.GetItemById<Video>(baseItemId);
+        if (video is not null)
+        {
+            var preTranscodedChapters = GetPreTranscodedChapters(video);
+            if (preTranscodedChapters is not null)
+            {
+                return preTranscodedChapters;
+            }
+        }
+
         return _chapterRepository.GetChapters(baseItemId);
+    }
+
+    /// <summary>
+    /// Gets chapters from pre-transcoded format by scanning the chapters folder.
+    /// Results are cached to avoid repeated file system scans.
+    /// </summary>
+    /// <param name="video">The video item.</param>
+    /// <returns>List of chapters if pre-transcoded format detected and chapters folder exists, null otherwise.</returns>
+    private IReadOnlyList<ChapterInfo>? GetPreTranscodedChapters(Video video)
+    {
+        if (_preTranscodedHlsHelper is null || !_preTranscodedHlsHelper.HasPreTranscodedHls(video))
+        {
+            return null;
+        }
+
+        var basePath = _preTranscodedHlsHelper.GetPreTranscodedBasePath(video);
+        if (basePath is null)
+        {
+            return null;
+        }
+
+        var chaptersDir = Path.Combine(basePath, "chapters");
+        if (!_fileSystem.DirectoryExists(chaptersDir))
+        {
+            return null;
+        }
+
+        try
+        {
+            var chapterFiles = _fileSystem.GetFiles(chaptersDir, false)
+                .Where(f => f.Extension.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || f.Extension.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (chapterFiles.Count == 0)
+            {
+                return null;
+            }
+
+            var chapters = new List<ChapterInfo>();
+
+            foreach (var file in chapterFiles)
+            {
+                var fileName = Path.GetFileNameWithoutExtension(file.Name);
+                long? chapterPositionTicks = null;
+
+                // Try to parse as simple format: {ChapterPositionTicks}.jpg
+                if (long.TryParse(fileName, out var ticks))
+                {
+                    chapterPositionTicks = ticks;
+                }
+                else
+                {
+                    // Try to parse as standard format: {DateModifiedTicks}_{ChapterPositionTicks}.jpg
+                    var parts = fileName.Split('_', 2);
+                    if (parts.Length == 2 && long.TryParse(parts[1], out ticks))
+                    {
+                        chapterPositionTicks = ticks;
+                    }
+                }
+
+                if (chapterPositionTicks.HasValue)
+                {
+                    // Normalize path to ensure consistent comparisons
+                    var fullPath = Path.GetFullPath(file.FullName);
+                    var imageDateModified = _fileSystem.GetLastWriteTimeUtc(fullPath);
+                    var chapter = new ChapterInfo
+                    {
+                        StartPositionTicks = chapterPositionTicks.Value,
+                        ImagePath = fullPath,
+                        ImageDateModified = imageDateModified
+                        // Name will be set after sorting
+                    };
+
+                    // Set ImageTag for cache invalidation - always set it for pre-transcoded chapters
+                    // Use a stable hash based on the file path and chapter position to ensure the tag never changes
+                    // This prevents cache misses and flickering
+                    // Create a stable tag based on the file path and chapter position
+                    // This ensures the tag remains constant as long as the file exists
+                    var stableTagSource = $"{fullPath}|{chapterPositionTicks.Value}";
+                    chapter.ImageTag = stableTagSource.GetMD5().ToString("N", System.Globalization.CultureInfo.InvariantCulture);
+
+                    chapters.Add(chapter);
+                }
+            }
+
+            // Sort by position ticks
+            chapters.Sort((a, b) => a.StartPositionTicks.CompareTo(b.StartPositionTicks));
+
+            // Set chapter names after sorting to ensure correct indices
+            for (int i = 0; i < chapters.Count; i++)
+            {
+                chapters[i].Name = $"Chapter {i + 1}";
+            }
+
+            if (chapters.Count > 0)
+            {
+                _logger.LogInformation("Found {Count} pre-transcoded chapter images for {Video}. Caching result.", chapters.Count, video.Name);
+
+                // Log chapter details for debugging
+                foreach (var chapter in chapters)
+                {
+                    _logger.LogTrace(
+                        "Chapter: Position={PositionTicks} ({PositionSeconds}s), Path={Path}, Tag={Tag}",
+                        chapter.StartPositionTicks,
+                        TimeSpan.FromTicks(chapter.StartPositionTicks).TotalSeconds,
+                        chapter.ImagePath,
+                        chapter.ImageTag);
+                }
+
+                // Cache the result
+                var result = chapters.AsReadOnly();
+
+                return result;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error scanning pre-transcoded chapters folder for {Video}", video.Name);
+        }
+
+        return null;
     }
 
     /// <inheritdoc />

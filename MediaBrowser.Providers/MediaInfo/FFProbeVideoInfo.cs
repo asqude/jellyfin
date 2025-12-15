@@ -24,6 +24,7 @@ using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.Globalization;
+using MediaBrowser.Model.IO;
 using MediaBrowser.Model.MediaInfo;
 using MediaBrowser.Model.Providers;
 using Microsoft.Extensions.Logging;
@@ -45,6 +46,7 @@ namespace MediaBrowser.Providers.MediaInfo
         private readonly SubtitleResolver _subtitleResolver;
         private readonly IMediaAttachmentRepository _mediaAttachmentRepository;
         private readonly IMediaStreamRepository _mediaStreamRepository;
+        private readonly IFileSystem _fileSystem;
 
         public FFProbeVideoInfo(
             ILogger<FFProbeVideoInfo> logger,
@@ -59,7 +61,8 @@ namespace MediaBrowser.Providers.MediaInfo
             AudioResolver audioResolver,
             SubtitleResolver subtitleResolver,
             IMediaAttachmentRepository mediaAttachmentRepository,
-            IMediaStreamRepository mediaStreamRepository)
+            IMediaStreamRepository mediaStreamRepository,
+            IFileSystem fileSystem)
         {
             _logger = logger;
             _mediaSourceManager = mediaSourceManager;
@@ -74,7 +77,8 @@ namespace MediaBrowser.Providers.MediaInfo
             _subtitleResolver = subtitleResolver;
             _mediaAttachmentRepository = mediaAttachmentRepository;
             _mediaStreamRepository = mediaStreamRepository;
-            _mediaStreamRepository = mediaStreamRepository;
+
+            _fileSystem = fileSystem;
         }
 
         public async Task<ItemUpdateType> ProbeVideo<T>(
@@ -168,6 +172,22 @@ namespace MediaBrowser.Providers.MediaInfo
             {
                 path = item.ShortcutPath;
                 protocol = _mediaSourceManager.GetPathProtocol(path);
+            }
+
+            var directoryPath = System.IO.Path.GetDirectoryName(path);
+            if (!string.IsNullOrEmpty(directoryPath))
+            {
+                var masterPlaylistPath = System.IO.Path.Combine(directoryPath, "master.m3u8");
+                if (_fileSystem.FileExists(masterPlaylistPath))
+                {
+                    _logger.LogInformation("Pre-transcoded HLS detected at {Path}, skipping ffprobe.", masterPlaylistPath);
+                    return Task.FromResult(new Model.MediaInfo.MediaInfo
+                    {
+                        MediaStreams = new List<MediaStream>(),
+                        MediaAttachments = new List<MediaAttachment>(),
+                        Chapters = Array.Empty<ChapterInfo>()
+                    });
+                }
             }
 
             return _mediaEncoder.GetMediaInfo(
